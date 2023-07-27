@@ -1,10 +1,5 @@
-import { App, debounce, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from 'obsidian';
-import { registerApi, FolderNoteAPI } from "@aidenlx/folder-note-core"
-
-enum FolderNoteType {
-	InsideFolder = "INSIDE_FOLDER",
-	OutsideFolder = "OUTSIDE_FOLDER"
-}
+import { App, debounce, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { getApi, isPluginEnabled, FolderNoteAPI } from "@aidenlx/folder-note-core"
 
 interface WaypointSettings {
 	waypointFlag: string
@@ -35,12 +30,19 @@ export default class Waypoint extends Plugin {
 	fnAPI: FolderNoteAPI;
 
 	async onload() {
-		registerApi(this, this.init);
-	} 
-	
-	
-	async init(api: FolderNoteAPI) {
-		this.fnAPI = api;
+		new Notice("loading custom thing");
+		if (!isPluginEnabled(this)) {
+			const message = "This fork only works with folder-note-core plugin!"
+			new Notice(message);
+			throw new Error(message);
+		}
+
+		this.fnAPI = getApi(this);
+		if (!this.fnAPI) {
+			const message = "Cant load folder-note-core for some reason"
+			new Notice(message);
+			throw new Error(message);
+		}
 
 		await this.loadSettings();
 		this.app.workspace.onLayoutReady(async () => {
@@ -88,7 +90,7 @@ export default class Waypoint extends Plugin {
 		const lines: string[] = text.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			if (lines[i].trim() === this.settings.waypointFlag) {
-				if (this.isFolderNote(file)) {
+				if (!!this.fnAPI.getFolderFromNote(file)) {
 					this.log("Found waypoint flag in folder note!");
 					await this.updateSingleWaypoint(file);
 					await this.updateParentWaypoint(file.parent);
@@ -151,11 +153,18 @@ export default class Waypoint extends Plugin {
 		const waypoint = `${Waypoint.BEGIN_WAYPOINT}\n${fileTree}\n\n${Waypoint.END_WAYPOINT}`;
 		const text = await this.app.vault.read(file);
 		const lines: string[] = text.split("\n")
-		const trimmed: string[] = lines.map(String.prototype.trim);
+		const trimmed: string[] = lines.map(line => line.trim());
 
 		const waypointFlag = trimmed.indexOf(this.settings.waypointFlag);
-		const waypointStart = trimmed.indexOf(Waypoint.BEGIN_WAYPOINT, waypointFlag);
-		const waypointEnd = trimmed.indexOf(Waypoint.END_WAYPOINT, waypointStart);
+		let waypointStart = -1;
+		let waypointEnd = -1;
+		if (waypointFlag >= 0) {
+			waypointStart = waypointFlag;
+			waypointEnd = waypointFlag;
+		} else {
+			waypointStart = trimmed.indexOf(Waypoint.BEGIN_WAYPOINT);
+			waypointEnd = trimmed.indexOf(Waypoint.END_WAYPOINT, waypointStart);
+		}
 
 		if (waypointStart === -1) {
 			console.error("Error: No waypoint found while trying to update " + file.path);
@@ -180,7 +189,7 @@ export default class Waypoint extends Plugin {
 		if (this.settings.showEnclosingNote) {
 			output = "ye";
 		}
-		return output + this.getRecursiveMarkdown(rootNode, node, 0);
+		return output + await this.getRecursiveMarkdown(rootNode, node, 0);
 	}
 	/**
 	 * Generate a file tree representation of the given folder.
@@ -191,6 +200,7 @@ export default class Waypoint extends Plugin {
 	 * @returns The string representation of the tree, or null if the node is not a file or folder
 	 */
 	async getRecursiveMarkdown(rootNode: TFolder, node: TAbstractFile, level: number): Promise<string>|null {
+		this.log(`passing ${node.path}`)
 		if (!(node instanceof TFile) && !(node instanceof TAbstractFile)) {
 			return null;
 		}
@@ -243,6 +253,7 @@ export default class Waypoint extends Plugin {
 					text += (text ?? "\n") + (await Promise.all(children.map(child => this.getRecursiveMarkdown(rootNode, child, nextIndentLevel))))
 					.filter(Boolean)
 					.join("\n");
+					this.log(`Children returned ${text}`);
 				}
 			}
 			return text;
@@ -303,7 +314,7 @@ export default class Waypoint extends Plugin {
 	 */
 	async locateParentWaypoint(node: TFolder): Promise<TFile> {
 		this.log("Locating parent waypoint of " + node.name);
-		let folder = node.parent;
+		let folder = node;
 		while (folder) {
 			const folderNote = this.fnAPI.getFolderNote(folder);
 			if (folderNote) {
