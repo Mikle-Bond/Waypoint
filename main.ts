@@ -1,4 +1,5 @@
 import { App, debounce, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { registerApi, FolderNoteAPI } from "@aidenlx/folder-note-core"
 
 enum FolderNoteType {
 	InsideFolder = "INSIDE_FOLDER",
@@ -12,8 +13,7 @@ interface WaypointSettings {
 	showNonMarkdownFiles: boolean,
 	debugLogging: boolean,
 	useWikiLinks: boolean,
-	showEnclosingNote: boolean,
-	folderNoteType: string
+	showEnclosingNote: boolean
 }
 
 const DEFAULT_SETTINGS: WaypointSettings = {
@@ -23,8 +23,7 @@ const DEFAULT_SETTINGS: WaypointSettings = {
 	showNonMarkdownFiles: false,
 	debugLogging: false,
 	useWikiLinks: true,
-	showEnclosingNote: false,
-	folderNoteType: FolderNoteType.InsideFolder
+	showEnclosingNote: false
 }
 
 export default class Waypoint extends Plugin {
@@ -33,8 +32,16 @@ export default class Waypoint extends Plugin {
 
 	foldersWithChanges = new Set<TFolder>();
 	settings: WaypointSettings;
+	fnAPI: FolderNoteAPI;
 
 	async onload() {
+		registerApi(this, this.init);
+	} 
+	
+	
+	async init(api: FolderNoteAPI) {
+		this.fnAPI = api;
+
 		await this.loadSettings();
 		this.app.workspace.onLayoutReady(async () => {
 			// Register events after layout is built to avoid initial wave of 'create' events
@@ -83,8 +90,8 @@ export default class Waypoint extends Plugin {
 			if (lines[i].trim() === this.settings.waypointFlag) {
 				if (this.isFolderNote(file)) {
 					this.log("Found waypoint flag in folder note!");
-					await this.updateWaypoint(file);
-					await this.updateParentWaypoint(file.parent, this.settings.folderNoteType === FolderNoteType.OutsideFolder);
+					await this.updateSingleWaypoint(file);
+					await this.updateParentWaypoint(file.parent);
 					return;	
 				} else if (file.parent.isRoot()) {
 					this.log("Found waypoint flag in root folder.");
@@ -101,14 +108,7 @@ export default class Waypoint extends Plugin {
 	}
 
 	isFolderNote(file: TFile): boolean {
-		if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-			return file.basename == file.parent.name;
-		} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-			if (file.parent) {
-				return this.app.vault.getAbstractFileByPath(this.getCleanParentPath(file) + file.basename) instanceof TFolder;
-			}
-			return false;
-		}
+		return !!(this.fnAPI.getFolderFromNote(file));
 	}
 
 	getCleanParentPath(node: TAbstractFile): string {
@@ -142,31 +142,21 @@ export default class Waypoint extends Plugin {
 	 * Given a file with a waypoint flag, generate a file tree representation and update the waypoint text.
 	 * @param file The file to update
 	 */
-	async updateWaypoint(file: TFile) {
+	async updateSingleWaypoint(file: TFile) {
 		this.log("Updating waypoint in " + file.path);
-		let fileTree;
-		if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-			fileTree = await this.getFileTreeRepresentation(file.parent, file.parent, 0, true);
-		} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-			const folder = this.app.vault.getAbstractFileByPath(this.getCleanParentPath(file) + file.basename);
-			if (folder instanceof TFolder) {
-				fileTree = await this.getFileTreeRepresentation(file.parent, folder, 0, true);
-			}
-		}
+		
+		const folder = this.fnAPI.getFolderFromNote(file);
+		const fileTree = await this.getFileTreeRepresentation(file.parent, folder);
+
 		const waypoint = `${Waypoint.BEGIN_WAYPOINT}\n${fileTree}\n\n${Waypoint.END_WAYPOINT}`;
 		const text = await this.app.vault.read(file);
-		const lines: string[] = text.split("\n");
-		let waypointStart = -1;
-		let waypointEnd = -1;
-		for (let i = 0; i < lines.length; i++) {
-			const trimmed = lines[i].trim();
-			if (waypointStart === -1 && (trimmed === this.settings.waypointFlag || trimmed === Waypoint.BEGIN_WAYPOINT)) {
-				waypointStart = i;
-			} else if (waypointStart !== -1 && trimmed === (Waypoint.END_WAYPOINT)) {
-				waypointEnd = i;
-				break;
-			}
-		}
+		const lines: string[] = text.split("\n")
+		const trimmed: string[] = lines.map(String.prototype.trim);
+
+		const waypointFlag = trimmed.indexOf(this.settings.waypointFlag);
+		const waypointStart = trimmed.indexOf(Waypoint.BEGIN_WAYPOINT, waypointFlag);
+		const waypointEnd = trimmed.indexOf(Waypoint.END_WAYPOINT, waypointStart);
+
 		if (waypointStart === -1) {
 			console.error("Error: No waypoint found while trying to update " + file.path);
 			return;
@@ -176,96 +166,87 @@ export default class Waypoint extends Plugin {
 		await this.app.vault.modify(file, lines.join("\n"));
 	}
 
+	getMarkdownLink(root: TFolder, target: TAbstractFile, indentLevel: number, text: string): string {
+		const bullet = "	".repeat(indentLevel) + "-";
+		if (this.settings.useWikiLinks) {
+			return `${bullet} [[${text}]]`;
+		} else {
+			return `${bullet} [${text}](${this.getEncodedUri(root, target)})`;
+		}
+	}
+
+	async getFileTreeRepresentation(rootNode: TFolder, node: TAbstractFile): Promise<string>|null {
+		let output = "";
+		if (this.settings.showEnclosingNote) {
+			output = "ye";
+		}
+		return output + this.getRecursiveMarkdown(rootNode, node, 0);
+	}
 	/**
 	 * Generate a file tree representation of the given folder.
 	 * @param rootNode The root of the file tree that will be generated
 	 * @param node The current node in our recursive descent
-	 * @param indentLevel How many levels of indentation to draw
+	 * @param level How many levels of indentation to draw
 	 * @param topLevel Whether this is the top level of the tree or not
 	 * @returns The string representation of the tree, or null if the node is not a file or folder
 	 */
-	async getFileTreeRepresentation(rootNode: TFolder, node: TAbstractFile, indentLevel: number, topLevel = false): Promise<string>|null {
-		const bullet = "	".repeat(indentLevel) + "-";
+	async getRecursiveMarkdown(rootNode: TFolder, node: TAbstractFile, level: number): Promise<string>|null {
+		if (!(node instanceof TFile) && !(node instanceof TAbstractFile)) {
+			return null;
+		}
+		
 		if (node instanceof TFile) {
-			console.log(node)
 			// Print the file name
 			if (node.extension == "md") {
-				if (this.settings.useWikiLinks) {
-					return `${bullet} [[${node.basename}]]`;
-				} else {
-					return `${bullet} [${node.basename}](${this.getEncodedUri(rootNode, node)})`;
-				}
+				return this.getMarkdownLink(rootNode, node, level, node.basename);
 			} else if (this.settings.showNonMarkdownFiles) {
-				if (this.settings.useWikiLinks) {
-					return `${bullet} [[${node.name}]]`;
-				} else {
-					return `${bullet} [${node.name}](${this.getEncodedUri(rootNode, node)})`;
-				}
+				return this.getMarkdownLink(rootNode, node, level, node.name);
 			}
 			return null;
-		} else if (node instanceof TFolder) {
+		}
+		
+		if (node instanceof TFolder) {
 			let text = "";
-			if (!topLevel || this.settings.showEnclosingNote) {
-				// Print the folder name
-				text = `${bullet} **${node.name}**`;
-				let folderNote;
-				if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-					folderNote = this.app.vault.getAbstractFileByPath(node.path + "/" + node.name + ".md");
-				} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-					if (node.parent) {
-						folderNote = this.app.vault.getAbstractFileByPath(node.parent.path + "/" + node.name + ".md");
+			
+			// Print the folder name
+			const selfFolderNote = this.fnAPI.getFolderNote(node);
+
+			if (selfFolderNote) {
+				text = this.getMarkdownLink(rootNode, selfFolderNote, level, selfFolderNote.basename);
+				if (level > 0) {
+					if (this.settings.stopScanAtFolderNotes) {
+						return text;
 					}
-				}
-				if (folderNote instanceof TFile) {
-					if (this.settings.useWikiLinks) {
-						text = `${bullet} **[[${folderNote.basename}]]**`;
-					} else {
-						text = `${bullet} **[${folderNote.basename}](${this.getEncodedUri(rootNode, folderNote)})**`;
-					}
-					if (!topLevel) {
-						if (this.settings.stopScanAtFolderNotes) {
-							return text;
-						} else {
-							const content = await this.app.vault.cachedRead(folderNote);
-							if (content.includes(Waypoint.BEGIN_WAYPOINT) || content.includes(this.settings.waypointFlag)) {
-								return text;
-							}
-						}
+
+					const content = await this.app.vault.cachedRead(selfFolderNote);
+					if (content.includes(Waypoint.BEGIN_WAYPOINT) || content.includes(this.settings.waypointFlag)) {
+						return text;
 					}
 				}
 			}
+		
 			if (node.children && node.children.length > 0) {
 				// Print the files and nested folders within the folder
 				let children = node.children;
 				children = children.sort((a, b) => {
 					return a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'});
 				});
+				// filter out other folder notes
 				if (!this.settings.showFolderNotes) {
-					if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-						children = children.filter(child => this.settings.showFolderNotes || child.name !== node.name + ".md");
-					} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-						const folderNames = new Set();
-						for (const element of children) {
-							if (element instanceof TFolder) {
-								folderNames.add(element.name + ".md");
-							}
-						}
-						children = children.filter(child => child instanceof TFolder || !folderNames.has(child.name));
-					}
+					children = children.filter(child => !(child instanceof TFile && this.isFolderNote(child as TFile)));
 				}
+				// filter out self
+				children = children.filter(child => child !== selfFolderNote);
+
 				if (children.length > 0) {
-					const nextIndentLevel = (topLevel && !this.settings.showEnclosingNote) ? indentLevel : indentLevel + 1;
-					text += (text === "" ? "" : "\n") + (await Promise.all(children.map(child => this.getFileTreeRepresentation(rootNode, child, nextIndentLevel))))
+					const nextIndentLevel = level + 1;
+					text += (text ?? "\n") + (await Promise.all(children.map(child => this.getRecursiveMarkdown(rootNode, child, nextIndentLevel))))
 					.filter(Boolean)
 					.join("\n");
 				}
-				return text;
-			} else {
-				return `${bullet} **${node.name}**`;
 			}
-
+			return text;
 		}
-		return null;
 	}
 
 	/**
@@ -288,7 +269,7 @@ export default class Waypoint extends Plugin {
 		this.log("Updating changed folders...");
 		this.foldersWithChanges.forEach((folder) => {
 			this.log("Updating " + folder.path);
-			this.updateParentWaypoint(folder, true);
+			this.updateParentWaypoint(folder); // ---------------------- OR CURRENT?!
 		});
 		this.foldersWithChanges.clear();
 	}
@@ -307,10 +288,10 @@ export default class Waypoint extends Plugin {
 	 * @param node The node to start the search from
 	 * @param includeCurrentNode Whether to include the given folder in the search
 	 */
-	updateParentWaypoint = async (node: TAbstractFile, includeCurrentNode: boolean) => {
-		const parentWaypoint = await this.locateParentWaypoint(node, includeCurrentNode);
+	updateParentWaypoint = async (node: TFolder) => {
+		const parentWaypoint = await this.locateParentWaypoint(node);
 		if (parentWaypoint !== null) {
-			this.updateWaypoint(parentWaypoint);
+			this.updateSingleWaypoint(parentWaypoint);
 		}
 	}
 
@@ -320,19 +301,12 @@ export default class Waypoint extends Plugin {
 	 * @param includeCurrentNode Whether to include the given folder in the search
 	 * @returns The ancestor waypoint, or null if none was found
 	 */
-	async locateParentWaypoint(node: TAbstractFile, includeCurrentNode: boolean): Promise<TFile> {
+	async locateParentWaypoint(node: TFolder): Promise<TFile> {
 		this.log("Locating parent waypoint of " + node.name);
-		let folder = includeCurrentNode ? node : node.parent;
+		let folder = node.parent;
 		while (folder) {
-			let folderNote;
-			if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-				folderNote = this.app.vault.getAbstractFileByPath(folder.path + "/" + folder.name + ".md");
-			} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-				if (folder.parent) {
-					folderNote = this.app.vault.getAbstractFileByPath(this.getCleanParentPath(folder) + folder.name + ".md");
-				}
-			}
-			if (folderNote instanceof TFile) {
+			const folderNote = this.fnAPI.getFolderNote(folder);
+			if (folderNote) {
 				this.log("Found folder note: " + folderNote.path);
 				const text = await this.app.vault.cachedRead(folderNote);
 				if (text.includes(Waypoint.BEGIN_WAYPOINT) || text.includes(this.settings.waypointFlag)) {
@@ -387,18 +361,6 @@ class WaypointSettingsTab extends PluginSettingTab {
 		const {containerEl} = this;
 		containerEl.empty();
 		containerEl.createEl('h2', {text: 'Waypoint Settings'});
-		new Setting(this.containerEl)
-			.setName("Folder Note Style")
-			.setDesc("Select the style of folder note used.")
-			.addDropdown((dropdown) => dropdown
-				.addOption(FolderNoteType.InsideFolder, "Folder Name Inside")
-				.addOption(FolderNoteType.OutsideFolder, "Folder Name Outside")
-				.setValue(this.plugin.settings.folderNoteType)
-				.onChange(async (value) => {
-					this.plugin.settings.folderNoteType = value;
-					await this.plugin.saveSettings();
-				})
-			);
 		new Setting(containerEl)
 			.setName("Show Folder Notes")
 			.setDesc("If enabled, folder notes will be listed alongside other notes in the generated waypoints.")
