@@ -84,6 +84,7 @@ export default class Waypoint extends Plugin {
 			window.clearInterval(timeoutId);
 			// Register events after layout is built to avoid initial wave of 'create' events
 			this.app.workspace.onLayoutReady(this.registerVaultEvents.bind(this));
+			this.registerEvent(this.app.vault.on("folder-note:cfg-changed", () => { this.fnAPI = getApi(this) }));
 			new Notice("Waypoint plugin loaded");
 		};
 
