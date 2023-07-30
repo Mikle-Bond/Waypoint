@@ -68,12 +68,6 @@ export default class Waypoint extends Plugin {
 			throw new Error(message);
 		}
 
-		const evtRef = this.app.vault.on("folder-note:api-ready", () => {
-			init();
-			if (timeoutId) window.clearTimeout(timeoutId);
-			this.app.vault.offref(evtRef); // register event only once
-		});
-
 		const timeoutId = window.setTimeout(() => {
 			if (!this.initialized) {
 				throw new Error(
@@ -103,6 +97,13 @@ export default class Waypoint extends Plugin {
 		init();
 	}
 
+	registerVaultEvents() {
+		this.registerEvent(this.app.vault.on("create", this.eventHandler.bind(this, "create")));
+		this.registerEvent(this.app.vault.on("modify", this.eventHandler.bind(this, "modify")));
+		this.registerEvent(this.app.vault.on("delete", this.eventHandler.bind(this, "delete")));
+		this.registerEvent(this.app.vault.on("rename", this.eventHandler.bind(this, "rename")));
+	}
+
 	eventHandler(name: string, node: TAbstractFile, oldPath?: string) {
 		this.log(`handler ${name}: ${node.path}`);
 		const addFolder = (folder: TFolder) => {
@@ -111,12 +112,16 @@ export default class Waypoint extends Plugin {
 			}
 		}
 		let folder: TFolder = node.parent;
-		if (node instanceof TFile && this.isFolderNote(node)) {
+		if (node instanceof TFile) {
 			// Folder notes might live outside the folder, that should be scanned
-			folder = this.fnAPI.getFolderFromNote(node);
-			// But this folder note might be(came) a waypoint.
-			// Such event should trigger update on two waypoints: this one, and its parent.
-			addFolder(folder.parent);
+			const linked = this.fnAPI.getFolderFromNote(node.path);
+			if (linked) {
+				this.log(`handler ${name}: ${node.path} is a waypoint, pointing at ${linked.path}`);
+				folder = linked;
+				// But this folder note might be(came) a waypoint.
+				// Such event should trigger update on two waypoints: this one, and its parent.
+				addFolder(folder.parent);
+			}
 		}
 		addFolder(folder);
 		if (oldPath) {
@@ -126,11 +131,65 @@ export default class Waypoint extends Plugin {
 		this.scheduleUpdate();
 	}
 
-	registerVaultEvents() {
-		this.registerEvent(this.app.vault.on("create", this.eventHandler.bind(this, "create")));
-		this.registerEvent(this.app.vault.on("modify", this.eventHandler.bind(this, "modify")));
-		this.registerEvent(this.app.vault.on("delete", this.eventHandler.bind(this, "delete")));
-		this.registerEvent(this.app.vault.on("rename", this.eventHandler.bind(this, "rename")));
+	/**
+	 * Schedule an update for the changed folders after debouncing to prevent excessive updates.
+	 */
+	scheduleUpdate = debounce(this.updateChangedFolders.bind(this), 500, true);
+
+	/**
+	 * Scan the changed folders and their ancestors for waypoints and update them if found.
+	 */
+	async updateChangedFolders() {
+		this.log("debouncer: updateChangedFolders");
+
+		// swap with empty set
+		let folders = new Set<TFolder>();
+		[folders, this.foldersWithChanges] = [this.foldersWithChanges, folders];
+
+		// gather waypoints into a set, so that they are processed once
+		let waypoints = new Set<TFile>();
+		for (const folder of folders) {
+			this.log("File changes in folder: " + folder.path);
+			const waypoint = await this.locateParentWaypoint(folder);
+			if (waypoint) {
+				waypoints.add(waypoint);
+			}
+		}
+		waypoints.forEach(this.updateWaypointFile.bind(this));
+	}
+
+	/**
+	 * Locate the ancestor waypoint (if any) of the given file/folder.
+	 * @param node The node to start the search from
+	 * @returns The ancestor waypoint, or null if none was found
+	 */
+	async locateParentWaypoint(node: TFolder): Promise<TFile> | null {
+		this.log("Locating parent waypoint of " + node.path);
+		let folder = node;
+		while (folder) {
+			const folderNote = this.fnAPI.getFolderNote(folder);
+			if (await this.hasWaypointFlag(folderNote)) {
+				this.log("Found folder note: " + folderNote.path);
+				return folderNote;
+			}
+			folder = folder.parent;
+		}
+		this.log("No parent waypoint found.");
+		return null;
+	}
+
+	/**
+	 * Get the parent folder of the given filepath if it exists.
+	 * @param path The filepath to search
+	 * @returns The parent folder, or null if none exists
+	 */
+	getParentFolder(path: string): TFolder | null {
+		const abstractFile = this.app.vault.getAbstractFileByPath(path.split("/").slice(0, -1).join("/"));
+		if (abstractFile instanceof TFolder) {
+			return abstractFile;
+		} else {
+			return null;
+		}
 	}
 
 	onunload() { }
@@ -315,67 +374,6 @@ export default class Waypoint extends Plugin {
 			return `./${encodeURI(node.path)}`;
 		}
 		return `./${encodeURI(node.path.substring(rootNode.path.length + 1))}`;
-	}
-
-	/**
-	 * Scan the changed folders and their ancestors for waypoints and update them if found.
-	 */
-	async updateChangedFolders() {
-		this.log("Updating changed folders...");
-
-		// swap with empty set
-		let folders = new Set<TFolder>();
-		[folders, this.foldersWithChanges] = [this.foldersWithChanges, folders];
-
-		// gather waypoints into a set, so that they are processed once
-		let waypoints = new Set<TFile>();
-		for (const folder of folders) {
-			this.log("File changes in folder: " + folder.path);
-			const waypoint = await this.locateParentWaypoint(folder);
-			if (waypoint) {
-				waypoints.add(waypoint);
-			}
-		}
-		waypoints.forEach(this.updateWaypointFile.bind(this));
-	}
-
-	/**
-	 * Schedule an update for the changed folders after debouncing to prevent excessive updates.
-	 */
-	scheduleUpdate = debounce(this.updateChangedFolders.bind(this), 500, true);
-
-	/**
-	 * Locate the ancestor waypoint (if any) of the given file/folder.
-	 * @param node The node to start the search from
-	 * @returns The ancestor waypoint, or null if none was found
-	 */
-	async locateParentWaypoint(node: TFolder): Promise<TFile> | null {
-		this.log("Locating parent waypoint of " + node.name);
-		let folder = node;
-		while (folder) {
-			const folderNote = this.fnAPI.getFolderNote(folder);
-			if (await this.hasWaypointFlag(folderNote)) {
-				this.log("Found folder note: " + folderNote.path);
-				return folderNote;
-			}
-			folder = folder.parent;
-		}
-		this.log("No parent waypoint found.");
-		return null;
-	}
-
-	/**
-	 * Get the parent folder of the given filepath if it exists.
-	 * @param path The filepath to search
-	 * @returns The parent folder, or null if none exists
-	 */
-	getParentFolder(path: string): TFolder | null {
-		const abstractFile = this.app.vault.getAbstractFileByPath(path.split("/").slice(0, -1).join("/"));
-		if (abstractFile instanceof TFolder) {
-			return abstractFile;
-		} else {
-			return null;
-		}
 	}
 
 	log(message: string) {
