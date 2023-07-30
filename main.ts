@@ -238,7 +238,7 @@ export default class Waypoint extends Plugin {
 		this.log("Updating waypoint in " + file.path);
 	
 		const folder = this.fnAPI.getFolderFromNote(file);
-		const fileTree = await this.getFolderContentMarkdown(file.parent, folder);
+		const fileTree = await this.getFolderContentMarkdown(folder, file.parent);
 
 		const waypoint = `${Waypoint.BEGIN_WAYPOINT}\n${fileTree}\n\n${Waypoint.END_WAYPOINT}`;
 		const text = await this.app.vault.read(file);
