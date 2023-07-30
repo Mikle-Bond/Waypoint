@@ -329,11 +329,13 @@ export default class Waypoint extends Plugin {
 		const title = this.getMarkdownLinkFolderNote(relativeTo, folder, selfFolderNote);
 		this.log(`getFolderMarkdown: ${title}`);
 
-		if (!selfFolderNote && this.settings.stopScanAtFolderNotes)
-			return title;
+		if (selfFolderNote) {
+			if (this.settings.stopScanAtFolderNotes)
+				return title;
 
-		if (selfFolderNote && await this.hasWaypointFlag(selfFolderNote))
-			return title;
+			if (await this.hasWaypointFlag(selfFolderNote))
+				return title;
+		}
 
 		const content = await this
 			.getFolderContentMarkdown(folder, relativeTo)
